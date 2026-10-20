@@ -1,0 +1,15 @@
+# Python 虛擬環境 (用 requirements.txt 重新安裝)
+venv/
+.venv/
+
+# Python 快取
+__pycache__/
+*.py[cod]
+
+# 環境變數 / 本機設定
+.env
+
+# 編輯器與作業系統產生的檔案
+.DS_Store
+.idea/
+.vscode/

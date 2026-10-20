@@ -1,0 +1,3 @@
+# producer.py / consumer.py 連 Kafka 用
+# (superset/setup_dashboard.py 只用標準函式庫，不需要額外套件)
+confluent-kafka==2.16.0

@@ -1,0 +1,181 @@
+services:
+  kafka:
+    image: apache/kafka:4.0.0
+    container_name: kafka
+    hostname: kafka
+    ports:
+      - "9092:9092"   # 給本機 (host) 的 client 使用
+    environment:
+      # ---- KRaft 基本設定 ----
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+
+      # ---- Listeners ----
+      # INTERNAL:  容器之間互連 (kafka:29092)
+      # EXTERNAL:  本機程式連線 (localhost:9092)
+      # CONTROLLER: KRaft controller 內部通訊
+      KAFKA_LISTENERS: INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+      # ---- 單節點需要把 replication 設為 1 ----
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"  # 送到不存在的 topic 時自動建立
+
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms512m"   # 預設 1G，本機開發調小
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # ---------------- Flink ----------------
+  jobmanager:
+    build: ./flink
+    image: flink-kafka:1.20.1
+    container_name: flink-jobmanager
+    command: jobmanager
+    ports:
+      - "8081:8081"   # Flink Web UI
+    environment:
+      # Docker Desktop 預設只給約 2GB 記憶體，Flink 記憶體設太大容器會被 OOM kill
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        jobmanager.memory.process.size: 768m
+    volumes:
+      - ./flink/sql:/opt/flink/sql
+
+  taskmanager:
+    build: ./flink
+    image: flink-kafka:1.20.1
+    container_name: flink-taskmanager
+    command: taskmanager
+    depends_on:
+      - jobmanager
+    environment:
+      # numberOfTaskSlots: 每個 job 佔 1 個 slot，練習時可同時跑 4 個 job
+      # (注意：註解不能寫在 | 區塊裡，否則會被當成設定值的一部分)
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        taskmanager.memory.process.size: 1024m
+
+  # 需要時才啟動：docker compose run --rm sql-client
+  sql-client:
+    build: ./flink
+    image: flink-kafka:1.20.1
+    command: bin/sql-client.sh
+    profiles: ["sql"]
+    depends_on:
+      - jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        rest.address: jobmanager
+    volumes:
+      - ./flink/sql:/opt/flink/sql
+
+  # ---------------- Data Lake: MinIO + Iceberg REST Catalog ----------------
+  # MinIO 官方已停止在 Docker Hub / quay.io 發布 image，改用 Bitnami 封存版
+  # (2025.4.22 是管理介面功能被拿掉前的版本，Object Browser 完整)
+  minio:
+    image: bitnamilegacy/minio:2025.4.22
+    container_name: minio
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # 管理介面 (Console)
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+      MINIO_DEFAULT_BUCKETS: warehouse   # 啟動時自動建立 bucket
+    volumes:
+      - minio-data:/bitnami/minio/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Iceberg REST Catalog：記錄每張表目前的 metadata 檔位置，Flink 與之後的 Trino 共用
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture:1.9.1
+    container_name: iceberg-rest
+    ports:
+      - "8181:8181"
+    environment:
+      # catalog 本身存在 SQLite (預設是 in-memory，重啟就會忘記有哪些表)
+      CATALOG_URI: jdbc:sqlite:/home/iceberg/iceberg_catalog.db
+      # SQLite 同時只能有一個寫入者，而 Flink 每次 checkpoint 會同時 commit 多張表。
+      # 連線池預設 2 條會互搶鎖 (SQLITE_BUSY -> commit 失敗 -> job 重啟)，改成 1 條讓 commit 排隊
+      CATALOG_CLIENTS: "1"
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+    volumes:
+      # 掛在 iceberg 使用者的 home，volume 才會繼承正確的擁有者 (掛到 /data 會 Permission denied)
+      - iceberg-catalog:/home/iceberg
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  # ---------------- 查詢與視覺化: Trino + Superset ----------------
+  # Trino：用 SQL 查 Iceberg 表 (Superset 無法直接讀 Iceberg，要透過查詢引擎)
+  trino:
+    image: trinodb/trino:476
+    container_name: trino
+    ports:
+      - "8082:8080"   # Trino Web UI (本機 8080 已給 kafka-ui)
+    volumes:
+      - ./trino/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
+    mem_limit: 1536m  # Trino 的 JVM 預設吃容器記憶體的 80%，不設上限會把 Docker 吃光
+    depends_on:
+      - iceberg-rest
+
+  # Superset：儀表板 (帳號 admin / admin)，啟動時自動建立 Trino 連線
+  superset:
+    build: ./superset
+    image: superset-trino:5.0.0
+    container_name: superset
+    command: ["/bin/sh", "/app/bootstrap.sh"]
+    ports:
+      - "8088:8088"
+    environment:
+      SUPERSET_SECRET_KEY: kafka-project-local-dev-secret
+    volumes:
+      - superset-home:/app/superset_home
+    depends_on:
+      - trino
+
+volumes:
+  kafka-data:
+  minio-data:
+  iceberg-catalog:
+  superset-home:
